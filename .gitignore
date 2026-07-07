@@ -24,3 +24,18 @@ web_custom_versions/
 filtered-openapi.yaml
 uv.lock
 .comfy_environment
+
+# Local workstation artifacts
+/.continue/
+/GIMP/
+/LORA_files/
+/Launch_5070Ti_ComfyUI_files/
+/crash_logs/
+/custom_nodes_DISABLED/
+/graphify-out/
+/manager_images/
+/outputs/
+*.bak
+*.bak-*
+*.backup-*
+extra_model_paths.yaml.*
