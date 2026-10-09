@@ -1,0 +1,19 @@
+name: LM Studio Heretic Coder
+version: 1.0.0
+schema: v1
+
+models:
+  - name: Gemma 4 12B Coder Fable Heretic
+    provider: lmstudio
+    model: gemma-4-12b-coder-fable5-composer2.5-v1-uncensored-heretic
+    apiBase: http://localhost:1234/v1
+    roles:
+      - chat
+      - edit
+      - apply
+    defaultCompletionOptions:
+      temperature: 0.15
+      topP: 0.8
+      maxTokens: 4096
+      contextLength: 8192
+
