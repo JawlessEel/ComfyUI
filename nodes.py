@@ -17,6 +17,7 @@ import logging
 from PIL import Image, ImageOps, ImageSequence
 from PIL.PngImagePlugin import PngInfo
 
+import av
 import numpy as np
 import safetensors.torch
 
@@ -31,6 +32,7 @@ from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict, FileLocator
 from comfy_api.internal import register_versions, ComfyAPIWithVersion
 from comfy_api.version_list import supported_versions
 from comfy_api.latest import io, ComfyExtension, InputImpl
+from comfy_api.latest._input_impl.video_types import _rotation_quadrant
 
 import comfy.clip_vision
 
@@ -1018,7 +1020,7 @@ class CLIPLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "clip_name": (folder_paths.get_filename_list("text_encoders"), ),
-                              "type": (["stable_diffusion", "stable_cascade", "sd3", "stable_audio", "mochi", "ltxv", "pixart", "cosmos", "lumina2", "wan", "hidream", "chroma", "ace", "omnigen2", "qwen_image", "hunyuan_image", "flux2", "ovis", "longcat_image", "cogvideox", "lens", "pixeldit", "ideogram4", "boogu", "krea2", "joyimage", "mage", "minimax", "yue2"], ),
+                              "type": (["stable_diffusion", "stable_cascade", "sd3", "stable_audio", "mochi", "ltxv", "pixart", "cosmos", "lumina2", "wan", "hidream", "chroma", "ace", "omnigen2", "qwen_image", "hunyuan_image", "flux2", "ovis", "longcat_image", "cogvideox", "lens", "pixeldit", "ideogram4", "boogu", "krea2", "joyimage", "mage", "minimax", "yue2", "flux3", "moss_image", "fibo2", "pan2"], ),
                               },
                 "optional": {
                               "device": (["default", "cpu"], {"advanced": True}),
@@ -1028,7 +1030,7 @@ class CLIPLoader:
 
     CATEGORY = "model/loaders"
 
-    DESCRIPTION = "Recipes:\nsd: clip-l\nstable cascade: clip-g\nsd3: t5 xxl / clip-g / clip-l\nstable audio: t5 base\nmochi: t5 xxl\ncogvideox: t5 xxl (226-token padding)\ncosmos: old t5 xxl\nlumina2: gemma 2 2B\nwan: umt5 xxl\nhidream: llama-3.1 (Recommend) or t5\nomnigen2: qwen vl 2.5 3B\njoyimage: qwen3-vl 8B\nlens: gpt-oss-20b\npixeldit: gemma 2 2B elm\nminimax: MiniMax H3 Qwen3-VL or Music3 Qwen/RVQ"
+    DESCRIPTION = "Recipes:\nsd: clip-l\nstable cascade: clip-g\nsd3: t5 xxl / clip-g / clip-l\nstable audio: t5 base\nmochi: t5 xxl\ncogvideox: t5 xxl (226-token padding)\ncosmos: old t5 xxl\nlumina2: gemma 2 2B\nwan: umt5 xxl\nhidream: llama-3.1 (Recommend) or t5\nomnigen2: qwen vl 2.5 3B\njoyimage: qwen3-vl 8B\nlens: gpt-oss-20b\npixeldit: gemma 2 2B elm\nminimax: MiniMax H3 Qwen3-VL or Music3 Qwen/RVQ\nflux3: qwen3-vl 4B\nfibo2: qwen3-vl 4B"
 
     def load_clip(self, clip_name, type="stable_diffusion", device="default"):
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
@@ -1744,6 +1746,13 @@ class PreviewImage(SaveImage):
                 "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
                 }
 
+def pyav_image_rotation_quadrant(path):
+    """Quarter turns pyav applies to the first decoded frame of an image (from its display matrix), 0 when none."""
+    with av.open(path) as container:
+        for frame in container.decode(video=0):
+            return _rotation_quadrant(frame)
+    return 0
+
 class LoadImage:
     @classmethod
     def INPUT_TYPES(s):
@@ -1769,7 +1778,17 @@ class LoadImage:
 
         components = InputImpl.VideoFromFile(image_path).get_components()
         if components.images.shape[0] > 0:
-            return (components.images.to(device=device, dtype=dtype), (1.0 - components.alpha[..., -1]).to(device=device, dtype=dtype) if components.alpha is not None else torch.zeros((components.images.shape[0], 64, 64), dtype=dtype, device=device))
+            images, alpha = components.images, components.alpha
+            orientation = node_helpers.image_exif_orientation(image_path)
+            if orientation != 1:
+                # pyav keeps the decoded pixels (incl. 16-bit precision) but applies EXIF orientation only partially and
+                # depending on its version (rotation only, and only when its ffmpeg exports it), so undo whatever rotation
+                # it applied and apply the full EXIF orientation from the file header instead.
+                k = pyav_image_rotation_quadrant(image_path)
+                images = node_helpers.apply_exif_orientation(images.rot90(-k, dims=(1, 2)), orientation)
+                if alpha is not None:
+                    alpha = node_helpers.apply_exif_orientation(alpha.rot90(-k, dims=(1, 2)), orientation)
+            return (images.to(device=device, dtype=dtype), (1.0 - alpha[..., -1]).to(device=device, dtype=dtype) if alpha is not None else torch.zeros((images.shape[0], 64, 64), dtype=dtype, device=device))
 
         # This code is left here to handle animated webp which pyav does not support loading
         img = node_helpers.pillow(Image.open, image_path)
@@ -1780,6 +1799,8 @@ class LoadImage:
 
         for i in ImageSequence.Iterator(img):
             i = node_helpers.pillow(ImageOps.exif_transpose, i)
+            if "transparency" in i.info:  # palette/tRNS transparency has no A band until converted
+                i = i.convert("RGBA")
 
             image = i.convert("RGB")
 
@@ -2368,7 +2389,11 @@ async def init_external_custom_nodes():
     node_paths = folder_paths.get_folder_paths("custom_nodes")
     node_import_times = []
     for custom_node_path in node_paths:
-        possible_modules = os.listdir(os.path.realpath(custom_node_path))
+        try:
+            possible_modules = os.listdir(os.path.realpath(custom_node_path))
+        except FileNotFoundError:
+            logging.warning("Skipping missing custom nodes directory: %s", custom_node_path)
+            continue
         if "__pycache__" in possible_modules:
             possible_modules.remove("__pycache__")
 
@@ -2507,6 +2532,8 @@ async def init_builtin_extra_nodes():
         "nodes_mage.py",
         "nodes_joyimage.py",
         "nodes_boogu.py",
+        "nodes_moss_image.py",
+        "nodes_fibo2.py",
         "nodes_chroma_radiance.py",
         "nodes_pid.py",
         "nodes_model_patch.py",
@@ -2532,6 +2559,7 @@ async def init_builtin_extra_nodes():
         "nodes_nag.py",
         "nodes_trellis2.py",
         "nodes_mesh_postprocess.py",
+        "nodes_ultratex.py",
         "nodes_sdpose.py",
         "nodes_math.py",
         "nodes_number_convert.py",
@@ -2541,7 +2569,9 @@ async def init_builtin_extra_nodes():
         "nodes_bg_removal.py",
         "nodes_rtdetr.py",
         "nodes_frame_interpolation.py",
+        "nodes_video_deflicker.py",
         "nodes_sam3.py",
+        "nodes_wevisone.py",
         "nodes_scail.py",
         "nodes_void.py",
         "nodes_wandancer.py",
